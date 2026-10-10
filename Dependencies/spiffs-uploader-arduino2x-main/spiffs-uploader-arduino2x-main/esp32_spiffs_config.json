@@ -1,0 +1,36 @@
+{
+  "project": {
+    "name": "ESP32_SPIFFS_Project",
+    "description": "ESP32 project with SPIFFS file system",
+    "version": "1.0.0"
+  },
+  "upload": {
+    "port": "COM4", 
+    "baud_rate": 921600,
+    "data_directory": "./data",
+    "partition_name": "spiffs",
+    "board": "esp32dev"
+  },
+  "board_settings": {
+    "flash_mode": "dio",
+    "flash_frequency": "80m",
+    "flash_size": "4MB"
+  },
+  "ota": {
+    "enabled": true,
+    "ip_address": "192.168.1.100",
+    "port": 3232,
+    "password": ""
+  },
+  "development": {
+    "verbose": true,
+    "auto_detect_tools": true,
+    "backup_before_upload": false
+  },
+"advanced": {
+  "partition_file": "C:/Users/PRATIKSHA/AppData/Local/Arduino15/packages/esp32/hardware/esp32/3.3.12/tools/partitions/no_ota.csv",
+  "custom_mkspiffs_args": [],
+  "custom_esptool_args": [],
+  "timeout_seconds": 60
+}
+}
