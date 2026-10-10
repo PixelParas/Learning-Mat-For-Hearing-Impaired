@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f5f7fb">
+  <title>Learning Mat Controller</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <main class="page-shell">
+    <header class="topbar">
+      <div class="brand-mark" aria-hidden="true">LM</div>
+      <div>
+        <p class="eyebrow">INCLUSIVE LEARNING MAT</p>
+        <h1>Audio & sensor controller</h1>
+        <p class="subhead">Choose a word, play it through either speaker, then let the child press the matching sensor.</p>
+      </div>
+      <div class="server-pill" id="server-status"><span class="status-dot"></span><span>Connecting…</span></div>
+    </header>
+
+    <section class="main-grid">
+      <section class="panel sound-panel">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">01 / PLAY A WORD</p>
+            <h2>Choose audio</h2>
+          </div>
+          <span class="muted tiny">MP3 files stored on both ESP32s</span>
+        </div>
+        <div class="sound-grid" id="sound-grid">
+          <button class="sound-button" data-label="birds"><span class="sound-emoji">🐦</span><span>Birds</span></button>
+          <button class="sound-button" data-label="ball"><span class="sound-emoji">⚽</span><span>Ball</span></button>
+          <button class="sound-button" data-label="cat"><span class="sound-emoji">🐈</span><span>Cat</span></button>
+          <button class="sound-button" data-label="dog"><span class="sound-emoji">🐕</span><span>Dog</span></button>
+          <button class="sound-button" data-label="mom"><span class="sound-emoji">👩</span><span>Mom</span></button>
+          <button class="sound-button" data-label="dad"><span class="sound-emoji">👨</span><span>Dad</span></button>
+        </div>
+        <div class="speaker-select">
+          <div>
+            <p class="eyebrow">02 / OUTPUT</p>
+            <h3>Play audio on</h3>
+          </div>
+          <label class="check-card"><input id="speaker-left" type="checkbox" checked><span class="fake-check"></span><span><strong>Left speaker</strong><small id="left-speaker-status">ESP32 not seen yet</small></span></label>
+          <label class="check-card"><input id="speaker-right" type="checkbox"><span class="fake-check"></span><span><strong>Right speaker</strong><small id="right-speaker-status">ESP32 not seen yet</small></span></label>
+        </div>
+        <div class="action-row">
+          <button id="repeat-button" class="button button-secondary" disabled><span aria-hidden="true">↻</span> Repeat last audio</button>
+          <p class="tiny muted" id="last-command">No audio command sent yet.</p>
+        </div>
+        <p class="selection-error" id="selection-error" role="alert" hidden></p>
+      </section>
+
+      <section class="panel target-panel">
+        <p class="eyebrow">03 / LIVE TRIAL</p>
+        <h2>Child response</h2>
+        <div class="target-card">
+          <span class="target-label">Current target</span>
+          <strong id="current-target">—</strong>
+          <span class="muted" id="target-hint">Choose a sound to begin a trial.</span>
+        </div>
+        <div class="result-box idle" id="result-box" aria-live="polite">
+          <span class="result-icon" id="result-icon">◷</span>
+          <div><strong id="result-title">Waiting to start</strong><p id="result-message">The result will appear when a sensor is pressed.</p></div>
+        </div>
+        <div class="stats-row">
+          <div class="stat"><strong id="success-count">0</strong><span>Successful trials</span></div>
+          <div class="stat"><strong id="attempt-count">0</strong><span>Sensor presses</span></div>
+        </div>
+      </section>
+    </section>
+
+    <section class="panel devices-panel">
+      <div class="section-heading">
+        <div><p class="eyebrow">04 / HARDWARE HEALTH</p><h2>ESP32 connections</h2></div>
+        <span class="tiny muted">A device is online if it polled in the last 7 seconds.</span>
+      </div>
+      <div class="device-grid">
+        <article class="device-card" id="device-left">
+          <div class="device-top"><div class="device-icon">L</div><div><h3>Left ESP32</h3><p>Birds · Ball · Cat</p></div><span class="online-badge offline" id="left-online">Offline</span></div>
+          <div class="device-metrics"><span>Commands waiting <strong id="left-queue">0</strong></span><span>Last contact <strong id="left-seen">Never</strong></span></div>
+        </article>
+        <article class="device-card" id="device-right">
+          <div class="device-top"><div class="device-icon right">R</div><div><h3>Right ESP32</h3><p>Dog · Mom · Dad</p></div><span class="online-badge offline" id="right-online">Offline</span></div>
+          <div class="device-metrics"><span>Commands waiting <strong id="right-queue">0</strong></span><span>Last contact <strong id="right-seen">Never</strong></span></div>
+        </article>
+      </div>
+    </section>
+
+    <section class="panel activity-panel">
+      <div class="section-heading"><div><p class="eyebrow">DEBUGGING</p><h2>Recent activity</h2></div><span class="tiny muted">Latest events first</span></div>
+      <div class="activity-list" id="activity-list"><p class="muted empty-state">No events yet.</p></div>
+    </section>
+
+    <footer><span>Prototype controller</span><span>For classroom testing, use short normalized MP3 clips and supervise children around wiring.</span></footer>
+  </main>
+  <script src="/app.js" defer></script>
+</body>
+</html>
