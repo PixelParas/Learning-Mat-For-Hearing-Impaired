@@ -29,6 +29,14 @@ const char* DEVICE_API_KEY = "local-dev-token-change-before-deployment";
 const char* DEVICE_ID = "right";
 const char* BT_SPEAKER_NAME = "M4";
 
+// ---------- FSR RESPONSE AUDIO ----------
+// When enabled, every FSR press plays that sensor's own WAV locally.
+// If it differs from the last dashboard-requested target, it plays quieter.
+const bool ENABLE_FSR_RESPONSE_AUDIO = true;
+const uint8_t NORMAL_ANSWER_VOLUME_PERCENT = 100;
+const uint8_t WRONG_ANSWER_VOLUME_PERCENT = 50;  // Adjustable: 0 (mute) to 100 (full).
+
+
 // Use one 10k resistor per FSR, wired as 3V3 -> FSR -> GPIO node -> 10k -> GND.
 #define FSR_USE_EXTERNAL_RESISTORS 1
 #if FSR_USE_EXTERNAL_RESISTORS
@@ -58,6 +66,14 @@ uint32_t wavBytesRemaining = 0;
 bool wavFileExhausted = false;
 bool audioPlaying = false;
 bool audioFilesReady = false;
+
+// Most recent sound requested by the dashboard (the learning target).
+char expectedTargetLabel[16] = {0};
+bool expectedTargetValid = false;
+
+// The A2DP callback applies this gain to signed 16-bit PCM samples.
+volatile uint8_t pcmVolumePercent = NORMAL_ANSWER_VOLUME_PERCENT;
+
 
 struct AudioCommand { uint32_t id; char label[16]; };
 struct SensorEvent { char label[16]; uint16_t raw; };
@@ -141,6 +157,7 @@ bool locatePcmData(File& file, uint32_t& dataSize) {
 // Bluetooth A2DP callback: return PCM bytes; silence is returned on underrun/idle.
 int32_t supplyPcmToA2dp(uint8_t* out, int32_t byteCount) {
   if (!out || byteCount <= 0) return 0;
+
   size_t copied = 0;
   while (pcmRing != nullptr && copied < (size_t)byteCount) {
     size_t available = 0;
@@ -151,7 +168,26 @@ int32_t supplyPcmToA2dp(uint8_t* out, int32_t byteCount) {
     copied += available;
     vRingbufferReturnItem(pcmRing, item);
   }
-  if (copied < (size_t)byteCount) memset(out + copied, 0, (size_t)byteCount - copied);
+  if (copied < (size_t)byteCount) {
+    memset(out + copied, 0, (size_t)byteCount - copied);
+  }
+
+  // WAV data is signed 16-bit little-endian PCM. Scale only the outgoing
+  // callback buffer; data stored in the PCM ring remains unchanged.
+  const uint8_t gain = pcmVolumePercent;
+  if (gain < 100) {
+    const int32_t sampleCount = byteCount / 2;
+    for (int32_t i = 0; i < sampleCount; ++i) {
+      const int32_t offset = i * 2;
+      const uint16_t raw = (uint16_t)out[offset] |
+                           ((uint16_t)out[offset + 1] << 8);
+      const int16_t sample = (int16_t)raw;
+      const int32_t scaled = ((int32_t)sample * gain) / 100;
+      const uint16_t scaledRaw = (uint16_t)(int16_t)scaled;
+      out[offset] = (uint8_t)(scaledRaw & 0xFF);
+      out[offset + 1] = (uint8_t)((scaledRaw >> 8) & 0xFF);
+    }
+  }
   return byteCount;
 }
 
@@ -165,19 +201,35 @@ void drainPcmRing() {
   }
 }
 
-bool beginWavPlayback(const char* label, uint32_t commandId) {
+bool beginWavPlayback(const char* label,
+                      uint32_t commandId,
+                      uint8_t volumePercent,
+                      bool updateExpectedTarget,
+                      bool interruptCurrent) {
   const char* path = pathForLabel(label);
   if (!path) {
     Serial.printf("[ERROR] Unknown label: %s\n", label);
     return false;
   }
-  if (audioPlaying) {
+
+  // Dashboard commands wait until the current clip finishes. A local FSR
+  // response can interrupt the target clip so the pressed item is heard now.
+  if (audioPlaying && !interruptCurrent) {
     Serial.printf("[AUDIO] Busy playing; ignoring command %lu (%s).\n",
                   (unsigned long)commandId, label);
     return false;
   }
+  if (audioPlaying && interruptCurrent) {
+    Serial.println("[AUDIO] Interrupting current clip for FSR response.");
+    pcmVolumePercent = 0;
+    audioPlaying = false;
+    wavBytesRemaining = 0;
+    wavFileExhausted = false;
+  }
+
   if (activeWav) activeWav.close();
   drainPcmRing();
+
   if (!SPIFFS.exists(path)) {
     Serial.printf("[ERROR] Missing audio file: %s\n", path);
     return false;
@@ -187,18 +239,60 @@ bool beginWavPlayback(const char* label, uint32_t commandId) {
     Serial.printf("[ERROR] Cannot open %s\n", path);
     return false;
   }
+
   uint32_t dataSize = 0;
   if (!locatePcmData(activeWav, dataSize)) {
     Serial.printf("[ERROR] %s must be PCM WAV, 16-bit stereo, 44100 Hz.\n", path);
     activeWav.close();
     return false;
   }
+
   wavBytesRemaining = dataSize;
   wavFileExhausted = false;
+  const uint8_t safeVolume = volumePercent > 100 ? 100 : volumePercent;
+  pcmVolumePercent = safeVolume;
+
+  if (updateExpectedTarget) {
+    strlcpy(expectedTargetLabel, label, sizeof(expectedTargetLabel));
+    expectedTargetValid = true;
+    Serial.printf("[TARGET] Dashboard target is now '%s'.\n", expectedTargetLabel);
+  }
+
   audioPlaying = true;
-  Serial.printf("[AUDIO] Command %lu: streaming %s (%s), PCM bytes=%lu\n",
-                (unsigned long)commandId, label, path, (unsigned long)dataSize);
+  if (commandId == 0) {
+    Serial.printf("[AUDIO] FSR feedback: streaming %s (%s) at %u%% volume, PCM bytes=%lu\n",
+                  label, path, (unsigned int)safeVolume, (unsigned long)dataSize);
+  } else {
+    Serial.printf("[AUDIO] Command %lu: streaming %s (%s) at %u%% volume, PCM bytes=%lu\n",
+                  (unsigned long)commandId, label, path, (unsigned int)safeVolume,
+                  (unsigned long)dataSize);
+  }
   return true;
+}
+
+// FSR feedback uses the pressed sensor's own audio. A mismatch from the last
+// dashboard target is played at WRONG_ANSWER_VOLUME_PERCENT.
+void handleFsrAudioFeedback(uint8_t sensorIndex) {
+  if (!ENABLE_FSR_RESPONSE_AUDIO || sensorIndex >= 3) return;
+
+  const char* pressedLabel = SENSOR_LABELS[sensorIndex];
+  const bool wrongAnswer =
+      expectedTargetValid && strcmp(pressedLabel, expectedTargetLabel) != 0;
+  const uint8_t volume = wrongAnswer
+      ? WRONG_ANSWER_VOLUME_PERCENT
+      : NORMAL_ANSWER_VOLUME_PERCENT;
+
+  if (expectedTargetValid) {
+    Serial.printf("[FEEDBACK] target=%s pressed=%s result=%s volume=%u%%\n",
+                  expectedTargetLabel, pressedLabel,
+                  wrongAnswer ? "WRONG" : "MATCH", (unsigned int)volume);
+  } else {
+    Serial.printf("[FEEDBACK] No target set; pressed=%s volume=%u%%\n",
+                  pressedLabel, (unsigned int)volume);
+  }
+
+  // Do not replace the target label with the child's response.
+  beginWavPlayback(pressedLabel, 0, volume, false, true);
 }
 
 // Keep the callback lightweight: this loop task fills the PCM ring from flash.
@@ -308,7 +402,10 @@ void playQueuedCommand() {
   if (audioPlaying || !commandQueue) return;
   AudioCommand command{};
   if (xQueueReceive(commandQueue, &command, 0) == pdTRUE) {
-    beginWavPlayback(command.label, command.id);
+    beginWavPlayback(command.label, command.id,
+                     NORMAL_ANSWER_VOLUME_PERCENT,
+                     true,   // update expected learning target
+                     false); // don't interrupt an existing server clip
   }
 }
 
@@ -497,6 +594,9 @@ void setup() {
   Serial.printf("[SYSTEM] Device=%s; labels=%s\n", DEVICE_ID,
     strcmp(DEVICE_ID, "left") == 0 ? "birds, ball, cat" : "dog, mom, dad");
   logAudioMemory("ready");
+  Serial.printf("[FEEDBACK] FSR response audio=%s; wrong-answer volume=%u%%\n",
+                ENABLE_FSR_RESPONSE_AUDIO ? "ENABLED" : "DISABLED",
+                (unsigned int)WRONG_ANSWER_VOLUME_PERCENT);
   Serial.println("[SYSTEM] Ready. Select a sound on the dashboard.");
 }
 
@@ -517,6 +617,7 @@ void loop() {
           pressCandidateAt[i] = 0;
           releaseCandidateAt[i] = 0;
           enqueueSensorEvent(i, raw);
+          handleFsrAudioFeedback(i);
         }
       } else {
         pressCandidateAt[i] = 0;
