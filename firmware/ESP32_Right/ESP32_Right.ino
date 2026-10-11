@@ -27,22 +27,25 @@ const char* WIFI_PASSWORD = "abcd1234";
 const char* API_BASE_URL = "http://10.190.101.155:3000"; // Laptop IPv4 + Express port
 const char* DEVICE_API_KEY = "local-dev-token-change-before-deployment";
 const char* DEVICE_ID = "right";
-const char* BT_SPEAKER_NAME = "M4";
+// Exact Bluetooth Classic MAC provided by the user for the RIGHT JBL M4.
+const char* BT_SPEAKER_ROLE = "RIGHT JBL M4";
+const uint8_t TARGET_SPEAKER_MAC[6] = {0x41, 0x42, 0xE7, 0x6F, 0x27, 0x91};
 
 // ---------- FSR RESPONSE AUDIO ----------
 // When enabled, every FSR press plays that sensor's own WAV locally.
 // If it differs from the last dashboard-requested target, it plays quieter.
 const bool ENABLE_FSR_RESPONSE_AUDIO = true;
 const uint8_t NORMAL_ANSWER_VOLUME_PERCENT = 100;
-const uint8_t WRONG_ANSWER_VOLUME_PERCENT = 50;  // Adjustable: 0 (mute) to 100 (full).
+const uint8_t WRONG_ANSWER_VOLUME_PERCENT = 100;  // Adjustable: 0 (mute) to 100 (full).
 
 
-// Use one 10k resistor per FSR, wired as 3V3 -> FSR -> GPIO node -> 10k -> GND.
-#define FSR_USE_EXTERNAL_RESISTORS 1
-#if FSR_USE_EXTERNAL_RESISTORS
-const uint8_t SENSOR_PINS[3] = { 35, 36, 39 };
+// Wiring per sensor: 3V3 -> FSR -> GPIO junction -> 10k resistor -> GND.
+// GPIO 32/33/34 are ADC1 pins on the classic ESP32 and work with Wi-Fi.
+#define FSR_USE_ANALOG_MODE 1
+#if FSR_USE_ANALOG_MODE
+const uint8_t SENSOR_PINS[3] = { 32, 33, 34 };
 #else
-const uint8_t SENSOR_PINS[3] = { 26, 27, 14 };
+const uint8_t SENSOR_PINS[3] = { 26, 27, 14 }; // Digital-only fallback
 #endif
 const char* SENSOR_LABELS[3] = {"dog", "mom", "dad"};
 
@@ -82,11 +85,26 @@ QueueHandle_t sensorQueue = nullptr;
 
 uint16_t sensorBaseline[3] = {0, 0, 0};
 uint16_t pressThreshold[3] = {1100, 1100, 1100};
-bool sensorLatched[3] = {false, false, false};
-uint32_t pressCandidateAt[3] = {0, 0, 0};
-uint32_t releaseCandidateAt[3] = {0, 0, 0};
+bool sensorCalibrationValid[3] = {true, true, true};
+// One-at-a-time press arbitration prevents adjacent/noisy sensors firing together.
+int8_t activeSensorIndex = -1;
+int8_t candidateSensorIndex = -1;
+uint32_t pressCandidateSince = 0;
+uint32_t releaseCandidateSince = 0;
 uint32_t lastStatusAt = 0;
 uint16_t lastRawValues[3] = {0, 0, 0};
+
+// BluetoothA2DPSource calls this during discovery. Only the exact configured
+// six-byte MAC is accepted, preventing either ESP32 from choosing the other
+// identically named "M4" speaker.
+bool selectTargetSpeaker(const char* discoveredName, esp_bd_addr_t address, int rssi) {
+  const bool matches = memcmp(address, TARGET_SPEAKER_MAC, 6) == 0;
+  Serial.printf("[BT DISCOVERY] name='%s' MAC=%02X:%02X:%02X:%02X:%02X:%02X RSSI=%d -> %s\n",
+    discoveredName ? discoveredName : "(unnamed)",
+    address[0], address[1], address[2], address[3], address[4], address[5], rssi,
+    matches ? "SELECT" : "skip");
+  return matches;
+}
 
 void logAudioMemory(const char* stage) {
   Serial.printf("[MEM] %s | free=%u | largest8bit=%u | internalFree=%u | minFree=%u\n",
@@ -335,7 +353,7 @@ void feedPcmRing() {
 }
 
 uint16_t readSensorRaw(uint8_t index) {
-#if FSR_USE_EXTERNAL_RESISTORS
+#if FSR_USE_ANALOG_MODE
   return (uint16_t)analogRead(SENSOR_PINS[index]);
 #else
   return digitalRead(SENSOR_PINS[index]) == HIGH ? 4095 : 0;
@@ -343,7 +361,7 @@ uint16_t readSensorRaw(uint8_t index) {
 }
 
 void calibrateSensors() {
-#if FSR_USE_EXTERNAL_RESISTORS
+#if FSR_USE_ANALOG_MODE
   Serial.println("[SENSOR] Keep all FSRs untouched for startup calibration...");
   uint32_t sums[3] = {0, 0, 0};
   for (uint8_t n = 0; n < SENSOR_CALIBRATION_SAMPLES; ++n) {
@@ -352,6 +370,14 @@ void calibrateSensors() {
   }
   for (uint8_t i = 0; i < 3; ++i) {
     sensorBaseline[i] = sums[i] / SENSOR_CALIBRATION_SAMPLES;
+    if (sensorBaseline[i] >= 3500) {
+      // A resting value near full-scale usually means incorrect wiring or a pressed sensor at startup.
+      sensorCalibrationValid[i] = false;
+      pressThreshold[i] = 4095;
+      Serial.printf("[SENSOR WARN] %s baseline=%u is too high; sensor disabled. Check 3V3 -> FSR -> GPIO junction, with 10k from junction to GND, and reboot with sensor released.\n",
+        SENSOR_LABELS[i], sensorBaseline[i]);
+      continue;
+    }
     uint16_t delta = sensorBaseline[i] / 12;
     if (delta < MIN_PRESS_DELTA) delta = MIN_PRESS_DELTA;
     uint32_t threshold = (uint32_t)sensorBaseline[i] + delta;
@@ -362,21 +388,22 @@ void calibrateSensors() {
       pressThreshold[i] > RELEASE_HYSTERESIS ? pressThreshold[i] - RELEASE_HYSTERESIS : 0);
   }
 #else
-  for (uint8_t i = 0; i < 3; ++i) pinMode(SENSOR_PINS[i], INPUT_PULLDOWN);
-  Serial.println("[SENSOR] Digital mode: FSR between 3V3 and GPIO, internal pull-down enabled.");
+  for (uint8_t i = 0; i < 3; ++i) pinMode(SENSOR_PINS[i], INPUT);
+  Serial.println("[SENSOR] Digital mode; external 10k pull-down from each GPIO junction to GND.");
 #endif
 }
 
 bool sensorPressureCondition(uint8_t index, uint16_t raw) {
-#if FSR_USE_EXTERNAL_RESISTORS
-  return raw >= pressThreshold[index];
+#if FSR_USE_ANALOG_MODE
+  return sensorCalibrationValid[index] && raw >= pressThreshold[index];
 #else
   (void)index;
   return raw == 4095;
 #endif
 }
 bool sensorReleaseCondition(uint8_t index, uint16_t raw) {
-#if FSR_USE_EXTERNAL_RESISTORS
+#if FSR_USE_ANALOG_MODE
+  if (!sensorCalibrationValid[index]) return true;
   const uint16_t releasePoint = pressThreshold[index] > RELEASE_HYSTERESIS
     ? pressThreshold[index] - RELEASE_HYSTERESIS : 0;
   return raw < releasePoint;
@@ -531,10 +558,10 @@ void setup() {
     while (true) delay(1000);
   }
 
-#if FSR_USE_EXTERNAL_RESISTORS
+#if FSR_USE_ANALOG_MODE
+  analogReadResolution(12);
   for (uint8_t i = 0; i < 3; ++i) {
     pinMode(SENSOR_PINS[i], INPUT);
-    analogReadResolution(12);
     analogSetPinAttenuation(SENSOR_PINS[i], ADC_11db);
   }
 #endif
@@ -578,10 +605,14 @@ void setup() {
 
   logAudioMemory("before BluetoothA2DPSource");
   a2dpSource.set_data_callback(supplyPcmToA2dp);
-  a2dpSource.set_auto_reconnect(false); // Debug first: prevent reconnect churn while testing.
-  Serial.printf("[BT] Starting direct callback A2DP source for sink '%s'.\n", BT_SPEAKER_NAME);
-  Serial.println("[BT] During setup, power off the other M4 speaker to prevent same-name ambiguity.");
-  a2dpSource.start(BT_SPEAKER_NAME);
+  a2dpSource.set_auto_reconnect(false); // First discovery must match the configured MAC exactly.
+  a2dpSource.set_ssid_callback(selectTargetSpeaker);
+  Serial.printf("[BT] Target speaker: %s MAC=%02X:%02X:%02X:%02X:%02X:%02X\n",
+    BT_SPEAKER_ROLE,
+    TARGET_SPEAKER_MAC[0], TARGET_SPEAKER_MAC[1], TARGET_SPEAKER_MAC[2],
+    TARGET_SPEAKER_MAC[3], TARGET_SPEAKER_MAC[4], TARGET_SPEAKER_MAC[5]);
+  Serial.println("[BT] Starting A2DP discovery; only the configured MAC will be accepted.");
+  a2dpSource.start();
   logAudioMemory("after BluetoothA2DPSource");
 
   BaseType_t taskResult = xTaskCreatePinnedToCore(
@@ -606,33 +637,56 @@ void loop() {
   feedPcmRing();
 
   const uint32_t now = millis();
+  uint16_t raw[3];
   for (uint8_t i = 0; i < 3; ++i) {
-    const uint16_t raw = readSensorRaw(i);
-    lastRawValues[i] = raw;
-    if (!sensorLatched[i]) {
-      if (sensorPressureCondition(i, raw)) {
-        if (pressCandidateAt[i] == 0) pressCandidateAt[i] = now;
-        if (now - pressCandidateAt[i] >= PRESS_DEBOUNCE_MS) {
-          sensorLatched[i] = true;
-          pressCandidateAt[i] = 0;
-          releaseCandidateAt[i] = 0;
-          enqueueSensorEvent(i, raw);
-          handleFsrAudioFeedback(i);
-        }
-      } else {
-        pressCandidateAt[i] = 0;
+    raw[i] = readSensorRaw(i);
+    lastRawValues[i] = raw[i];
+  }
+
+  // Once one sensor is accepted, ignore other sensors until it is released.
+  // This prevents one physical press/noisy shared wiring from enqueuing two labels.
+  if (activeSensorIndex >= 0) {
+    const uint8_t i = (uint8_t)activeSensorIndex;
+    if (sensorReleaseCondition(i, raw[i])) {
+      if (releaseCandidateSince == 0) releaseCandidateSince = now;
+      if (now - releaseCandidateSince >= RELEASE_DEBOUNCE_MS) {
+        Serial.printf("[SENSOR] RELEASE %s raw=%u\n", SENSOR_LABELS[i], raw[i]);
+        activeSensorIndex = -1;
+        releaseCandidateSince = 0;
+        candidateSensorIndex = -1;
+        pressCandidateSince = 0;
       }
     } else {
-      if (sensorReleaseCondition(i, raw)) {
-        if (releaseCandidateAt[i] == 0) releaseCandidateAt[i] = now;
-        if (now - releaseCandidateAt[i] >= RELEASE_DEBOUNCE_MS) {
-          sensorLatched[i] = false;
-          releaseCandidateAt[i] = 0;
-          Serial.printf("[SENSOR] RELEASE %s raw=%u\n", SENSOR_LABELS[i], raw);
-        }
-      } else {
-        releaseCandidateAt[i] = 0;
+      releaseCandidateSince = 0;
+    }
+  } else {
+    // If more than one channel crosses its threshold, select the strongest
+    // change above baseline and only debounce that one candidate.
+    int8_t best = -1;
+    uint16_t bestDelta = 0;
+    for (uint8_t i = 0; i < 3; ++i) {
+      if (!sensorPressureCondition(i, raw[i])) continue;
+      const uint16_t delta = raw[i] > sensorBaseline[i]
+        ? (uint16_t)(raw[i] - sensorBaseline[i]) : raw[i];
+      if (best < 0 || delta > bestDelta) {
+        best = (int8_t)i;
+        bestDelta = delta;
       }
+    }
+
+    if (best < 0) {
+      candidateSensorIndex = -1;
+      pressCandidateSince = 0;
+    } else if (candidateSensorIndex != best) {
+      candidateSensorIndex = best;
+      pressCandidateSince = now;
+    } else if (now - pressCandidateSince >= PRESS_DEBOUNCE_MS) {
+      activeSensorIndex = best;
+      candidateSensorIndex = -1;
+      pressCandidateSince = 0;
+      releaseCandidateSince = 0;
+      enqueueSensorEvent((uint8_t)best, raw[best]);
+      handleFsrAudioFeedback((uint8_t)best);
     }
   }
 

@@ -27,14 +27,24 @@ const char* WIFI_PASSWORD = "abcd1234";
 const char* API_BASE_URL = "http://10.190.101.155:3000"; // Laptop IPv4 + Express port
 const char* DEVICE_API_KEY = "local-dev-token-change-before-deployment";
 const char* DEVICE_ID = "left";
-const char* BT_SPEAKER_NAME = "M4";
+// Exact Bluetooth Classic MAC provided by the user for the LEFT JBL M4.
+const char* BT_SPEAKER_ROLE = "LEFT JBL M4";
+const uint8_t TARGET_SPEAKER_MAC[6] = {0x41, 0x42, 0x49, 0x23, 0xB4, 0x78};
 
-// Use one 10k resistor per FSR, wired as 3V3 -> FSR -> GPIO node -> 10k -> GND.
-#define FSR_USE_EXTERNAL_RESISTORS 1
-#if FSR_USE_EXTERNAL_RESISTORS
-const uint8_t SENSOR_PINS[3] = { 32, 33, 34 };
+// ---------- FSR RESPONSE AUDIO ----------
+const bool ENABLE_FSR_RESPONSE_AUDIO = true;
+const uint8_t NORMAL_ANSWER_VOLUME_PERCENT = 100;
+const uint8_t WRONG_ANSWER_VOLUME_PERCENT = 100; // 0=mute, 100=full volume.
+
+
+// Wiring per sensor: 3V3 -> FSR -> GPIO junction -> 10k resistor -> GND.
+// Classic ESP32 GPIO 21/22/23 are NOT ADC pins. Keep digital mode for these
+// physically convenient pins. Set to 1 only if rewired to ADC pins 32/33/34.
+#define FSR_USE_ANALOG_MODE 1
+#if FSR_USE_ANALOG_MODE
+const uint8_t SENSOR_PINS[3] = { 32, 33, 34 }; // ADC1, analog readings with Wi-Fi
 #else
-const uint8_t SENSOR_PINS[3] = { 32, 33, 25 };
+const uint8_t SENSOR_PINS[3] = { 21, 22, 23 }; // Digital-only press detection
 #endif
 const char* SENSOR_LABELS[3] = {"birds", "ball", "cat"};
 
@@ -59,6 +69,12 @@ bool wavFileExhausted = false;
 bool audioPlaying = false;
 bool audioFilesReady = false;
 
+// Latest dashboard target used to compare a child's FSR response.
+char expectedTargetLabel[16] = {0};
+bool expectedTargetValid = false;
+volatile uint8_t pcmVolumePercent = NORMAL_ANSWER_VOLUME_PERCENT;
+
+
 struct AudioCommand { uint32_t id; char label[16]; };
 struct SensorEvent { char label[16]; uint16_t raw; };
 QueueHandle_t commandQueue = nullptr;
@@ -66,11 +82,26 @@ QueueHandle_t sensorQueue = nullptr;
 
 uint16_t sensorBaseline[3] = {0, 0, 0};
 uint16_t pressThreshold[3] = {1100, 1100, 1100};
-bool sensorLatched[3] = {false, false, false};
-uint32_t pressCandidateAt[3] = {0, 0, 0};
-uint32_t releaseCandidateAt[3] = {0, 0, 0};
+bool sensorCalibrationValid[3] = {true, true, true};
+// One-at-a-time press arbitration prevents adjacent/noisy sensors firing together.
+int8_t activeSensorIndex = -1;
+int8_t candidateSensorIndex = -1;
+uint32_t pressCandidateSince = 0;
+uint32_t releaseCandidateSince = 0;
 uint32_t lastStatusAt = 0;
 uint16_t lastRawValues[3] = {0, 0, 0};
+
+// BluetoothA2DPSource calls this during discovery. Only the exact configured
+// six-byte MAC is accepted, preventing either ESP32 from choosing the other
+// identically named "M4" speaker.
+bool selectTargetSpeaker(const char* discoveredName, esp_bd_addr_t address, int rssi) {
+  const bool matches = memcmp(address, TARGET_SPEAKER_MAC, 6) == 0;
+  Serial.printf("[BT DISCOVERY] name='%s' MAC=%02X:%02X:%02X:%02X:%02X:%02X RSSI=%d -> %s\n",
+    discoveredName ? discoveredName : "(unnamed)",
+    address[0], address[1], address[2], address[3], address[4], address[5], rssi,
+    matches ? "SELECT" : "skip");
+  return matches;
+}
 
 void logAudioMemory(const char* stage) {
   Serial.printf("[MEM] %s | free=%u | largest8bit=%u | internalFree=%u | minFree=%u\n",
@@ -141,6 +172,7 @@ bool locatePcmData(File& file, uint32_t& dataSize) {
 // Bluetooth A2DP callback: return PCM bytes; silence is returned on underrun/idle.
 int32_t supplyPcmToA2dp(uint8_t* out, int32_t byteCount) {
   if (!out || byteCount <= 0) return 0;
+
   size_t copied = 0;
   while (pcmRing != nullptr && copied < (size_t)byteCount) {
     size_t available = 0;
@@ -151,7 +183,26 @@ int32_t supplyPcmToA2dp(uint8_t* out, int32_t byteCount) {
     copied += available;
     vRingbufferReturnItem(pcmRing, item);
   }
-  if (copied < (size_t)byteCount) memset(out + copied, 0, (size_t)byteCount - copied);
+  if (copied < (size_t)byteCount) {
+    memset(out + copied, 0, (size_t)byteCount - copied);
+  }
+
+  // WAV data is signed 16-bit little-endian PCM. Scale only the outgoing
+  // callback buffer; data stored in the PCM ring remains unchanged.
+  const uint8_t gain = pcmVolumePercent;
+  if (gain < 100) {
+    const int32_t sampleCount = byteCount / 2;
+    for (int32_t i = 0; i < sampleCount; ++i) {
+      const int32_t offset = i * 2;
+      const uint16_t raw = (uint16_t)out[offset] |
+                           ((uint16_t)out[offset + 1] << 8);
+      const int16_t sample = (int16_t)raw;
+      const int32_t scaled = ((int32_t)sample * gain) / 100;
+      const uint16_t scaledRaw = (uint16_t)(int16_t)scaled;
+      out[offset] = (uint8_t)(scaledRaw & 0xFF);
+      out[offset + 1] = (uint8_t)((scaledRaw >> 8) & 0xFF);
+    }
+  }
   return byteCount;
 }
 
@@ -165,19 +216,35 @@ void drainPcmRing() {
   }
 }
 
-bool beginWavPlayback(const char* label, uint32_t commandId) {
+bool beginWavPlayback(const char* label,
+                      uint32_t commandId,
+                      uint8_t volumePercent,
+                      bool updateExpectedTarget,
+                      bool interruptCurrent) {
   const char* path = pathForLabel(label);
   if (!path) {
     Serial.printf("[ERROR] Unknown label: %s\n", label);
     return false;
   }
-  if (audioPlaying) {
+
+  // Dashboard commands wait until the current clip finishes. A local FSR
+  // response can interrupt the target clip so the pressed item is heard now.
+  if (audioPlaying && !interruptCurrent) {
     Serial.printf("[AUDIO] Busy playing; ignoring command %lu (%s).\n",
                   (unsigned long)commandId, label);
     return false;
   }
+  if (audioPlaying && interruptCurrent) {
+    Serial.println("[AUDIO] Interrupting current clip for FSR response.");
+    pcmVolumePercent = 0;
+    audioPlaying = false;
+    wavBytesRemaining = 0;
+    wavFileExhausted = false;
+  }
+
   if (activeWav) activeWav.close();
   drainPcmRing();
+
   if (!SPIFFS.exists(path)) {
     Serial.printf("[ERROR] Missing audio file: %s\n", path);
     return false;
@@ -187,18 +254,60 @@ bool beginWavPlayback(const char* label, uint32_t commandId) {
     Serial.printf("[ERROR] Cannot open %s\n", path);
     return false;
   }
+
   uint32_t dataSize = 0;
   if (!locatePcmData(activeWav, dataSize)) {
     Serial.printf("[ERROR] %s must be PCM WAV, 16-bit stereo, 44100 Hz.\n", path);
     activeWav.close();
     return false;
   }
+
   wavBytesRemaining = dataSize;
   wavFileExhausted = false;
+  const uint8_t safeVolume = volumePercent > 100 ? 100 : volumePercent;
+  pcmVolumePercent = safeVolume;
+
+  if (updateExpectedTarget) {
+    strlcpy(expectedTargetLabel, label, sizeof(expectedTargetLabel));
+    expectedTargetValid = true;
+    Serial.printf("[TARGET] Dashboard target is now '%s'.\n", expectedTargetLabel);
+  }
+
   audioPlaying = true;
-  Serial.printf("[AUDIO] Command %lu: streaming %s (%s), PCM bytes=%lu\n",
-                (unsigned long)commandId, label, path, (unsigned long)dataSize);
+  if (commandId == 0) {
+    Serial.printf("[AUDIO] FSR feedback: streaming %s (%s) at %u%% volume, PCM bytes=%lu\n",
+                  label, path, (unsigned int)safeVolume, (unsigned long)dataSize);
+  } else {
+    Serial.printf("[AUDIO] Command %lu: streaming %s (%s) at %u%% volume, PCM bytes=%lu\n",
+                  (unsigned long)commandId, label, path, (unsigned int)safeVolume,
+                  (unsigned long)dataSize);
+  }
   return true;
+}
+
+// FSR feedback uses the pressed sensor's own audio. A mismatch from the last
+// dashboard target is played at WRONG_ANSWER_VOLUME_PERCENT.
+void handleFsrAudioFeedback(uint8_t sensorIndex) {
+  if (!ENABLE_FSR_RESPONSE_AUDIO || sensorIndex >= 3) return;
+
+  const char* pressedLabel = SENSOR_LABELS[sensorIndex];
+  const bool wrongAnswer =
+      expectedTargetValid && strcmp(pressedLabel, expectedTargetLabel) != 0;
+  const uint8_t volume = wrongAnswer
+      ? WRONG_ANSWER_VOLUME_PERCENT
+      : NORMAL_ANSWER_VOLUME_PERCENT;
+
+  if (expectedTargetValid) {
+    Serial.printf("[FEEDBACK] target=%s pressed=%s result=%s volume=%u%%\n",
+                  expectedTargetLabel, pressedLabel,
+                  wrongAnswer ? "WRONG" : "MATCH", (unsigned int)volume);
+  } else {
+    Serial.printf("[FEEDBACK] No target set; pressed=%s volume=%u%%\n",
+                  pressedLabel, (unsigned int)volume);
+  }
+
+  // Do not replace the target label with the child's response.
+  beginWavPlayback(pressedLabel, 0, volume, false, true);
 }
 
 // Keep the callback lightweight: this loop task fills the PCM ring from flash.
@@ -241,7 +350,7 @@ void feedPcmRing() {
 }
 
 uint16_t readSensorRaw(uint8_t index) {
-#if FSR_USE_EXTERNAL_RESISTORS
+#if FSR_USE_ANALOG_MODE
   return (uint16_t)analogRead(SENSOR_PINS[index]);
 #else
   return digitalRead(SENSOR_PINS[index]) == HIGH ? 4095 : 0;
@@ -249,7 +358,7 @@ uint16_t readSensorRaw(uint8_t index) {
 }
 
 void calibrateSensors() {
-#if FSR_USE_EXTERNAL_RESISTORS
+#if FSR_USE_ANALOG_MODE
   Serial.println("[SENSOR] Keep all FSRs untouched for startup calibration...");
   uint32_t sums[3] = {0, 0, 0};
   for (uint8_t n = 0; n < SENSOR_CALIBRATION_SAMPLES; ++n) {
@@ -258,6 +367,14 @@ void calibrateSensors() {
   }
   for (uint8_t i = 0; i < 3; ++i) {
     sensorBaseline[i] = sums[i] / SENSOR_CALIBRATION_SAMPLES;
+    if (sensorBaseline[i] >= 3500) {
+      // A resting value near full-scale usually means incorrect wiring or a pressed sensor at startup.
+      sensorCalibrationValid[i] = false;
+      pressThreshold[i] = 4095;
+      Serial.printf("[SENSOR WARN] %s baseline=%u is too high; sensor disabled. Check 3V3 -> FSR -> GPIO junction, with 10k from junction to GND, and reboot with sensor released.\n",
+        SENSOR_LABELS[i], sensorBaseline[i]);
+      continue;
+    }
     uint16_t delta = sensorBaseline[i] / 12;
     if (delta < MIN_PRESS_DELTA) delta = MIN_PRESS_DELTA;
     uint32_t threshold = (uint32_t)sensorBaseline[i] + delta;
@@ -268,21 +385,22 @@ void calibrateSensors() {
       pressThreshold[i] > RELEASE_HYSTERESIS ? pressThreshold[i] - RELEASE_HYSTERESIS : 0);
   }
 #else
-  for (uint8_t i = 0; i < 3; ++i) pinMode(SENSOR_PINS[i], INPUT_PULLDOWN);
-  Serial.println("[SENSOR] Digital mode: FSR between 3V3 and GPIO, internal pull-down enabled.");
+  for (uint8_t i = 0; i < 3; ++i) pinMode(SENSOR_PINS[i], INPUT);
+  Serial.println("[SENSOR] Digital mode on GPIO 21/22/23; external 10k pull-down from each GPIO junction to GND.");
 #endif
 }
 
 bool sensorPressureCondition(uint8_t index, uint16_t raw) {
-#if FSR_USE_EXTERNAL_RESISTORS
-  return raw >= pressThreshold[index];
+#if FSR_USE_ANALOG_MODE
+  return sensorCalibrationValid[index] && raw >= pressThreshold[index];
 #else
   (void)index;
   return raw == 4095;
 #endif
 }
 bool sensorReleaseCondition(uint8_t index, uint16_t raw) {
-#if FSR_USE_EXTERNAL_RESISTORS
+#if FSR_USE_ANALOG_MODE
+  if (!sensorCalibrationValid[index]) return true;
   const uint16_t releasePoint = pressThreshold[index] > RELEASE_HYSTERESIS
     ? pressThreshold[index] - RELEASE_HYSTERESIS : 0;
   return raw < releasePoint;
@@ -308,7 +426,10 @@ void playQueuedCommand() {
   if (audioPlaying || !commandQueue) return;
   AudioCommand command{};
   if (xQueueReceive(commandQueue, &command, 0) == pdTRUE) {
-    beginWavPlayback(command.label, command.id);
+    beginWavPlayback(command.label, command.id,
+                     NORMAL_ANSWER_VOLUME_PERCENT,
+                     true,   // update expected learning target
+                     false); // do not interrupt an existing dashboard clip
   }
 }
 
@@ -434,10 +555,10 @@ void setup() {
     while (true) delay(1000);
   }
 
-#if FSR_USE_EXTERNAL_RESISTORS
+#if FSR_USE_ANALOG_MODE
+  analogReadResolution(12);
   for (uint8_t i = 0; i < 3; ++i) {
     pinMode(SENSOR_PINS[i], INPUT);
-    analogReadResolution(12);
     analogSetPinAttenuation(SENSOR_PINS[i], ADC_11db);
   }
 #endif
@@ -481,10 +602,14 @@ void setup() {
 
   logAudioMemory("before BluetoothA2DPSource");
   a2dpSource.set_data_callback(supplyPcmToA2dp);
-  a2dpSource.set_auto_reconnect(false); // Debug first: prevent reconnect churn while testing.
-  Serial.printf("[BT] Starting direct callback A2DP source for sink '%s'.\n", BT_SPEAKER_NAME);
-  Serial.println("[BT] During setup, power off the other M4 speaker to prevent same-name ambiguity.");
-  a2dpSource.start(BT_SPEAKER_NAME);
+  a2dpSource.set_auto_reconnect(false); // First discovery must match the configured MAC exactly.
+  a2dpSource.set_ssid_callback(selectTargetSpeaker);
+  Serial.printf("[BT] Target speaker: %s MAC=%02X:%02X:%02X:%02X:%02X:%02X\n",
+    BT_SPEAKER_ROLE,
+    TARGET_SPEAKER_MAC[0], TARGET_SPEAKER_MAC[1], TARGET_SPEAKER_MAC[2],
+    TARGET_SPEAKER_MAC[3], TARGET_SPEAKER_MAC[4], TARGET_SPEAKER_MAC[5]);
+  Serial.println("[BT] Starting A2DP discovery; only the configured MAC will be accepted.");
+  a2dpSource.start();
   logAudioMemory("after BluetoothA2DPSource");
 
   BaseType_t taskResult = xTaskCreatePinnedToCore(
@@ -497,6 +622,9 @@ void setup() {
   Serial.printf("[SYSTEM] Device=%s; labels=%s\n", DEVICE_ID,
     strcmp(DEVICE_ID, "left") == 0 ? "birds, ball, cat" : "dog, mom, dad");
   logAudioMemory("ready");
+  Serial.printf("[FEEDBACK] FSR response audio=%s; wrong-answer volume=%u%%\n",
+                ENABLE_FSR_RESPONSE_AUDIO ? "ENABLED" : "DISABLED",
+                (unsigned int)WRONG_ANSWER_VOLUME_PERCENT);
   Serial.println("[SYSTEM] Ready. Select a sound on the dashboard.");
 }
 
@@ -506,32 +634,56 @@ void loop() {
   feedPcmRing();
 
   const uint32_t now = millis();
+  uint16_t raw[3];
   for (uint8_t i = 0; i < 3; ++i) {
-    const uint16_t raw = readSensorRaw(i);
-    lastRawValues[i] = raw;
-    if (!sensorLatched[i]) {
-      if (sensorPressureCondition(i, raw)) {
-        if (pressCandidateAt[i] == 0) pressCandidateAt[i] = now;
-        if (now - pressCandidateAt[i] >= PRESS_DEBOUNCE_MS) {
-          sensorLatched[i] = true;
-          pressCandidateAt[i] = 0;
-          releaseCandidateAt[i] = 0;
-          enqueueSensorEvent(i, raw);
-        }
-      } else {
-        pressCandidateAt[i] = 0;
+    raw[i] = readSensorRaw(i);
+    lastRawValues[i] = raw[i];
+  }
+
+  // Once one sensor is accepted, ignore other sensors until it is released.
+  // This prevents one physical press/noisy shared wiring from enqueuing two labels.
+  if (activeSensorIndex >= 0) {
+    const uint8_t i = (uint8_t)activeSensorIndex;
+    if (sensorReleaseCondition(i, raw[i])) {
+      if (releaseCandidateSince == 0) releaseCandidateSince = now;
+      if (now - releaseCandidateSince >= RELEASE_DEBOUNCE_MS) {
+        Serial.printf("[SENSOR] RELEASE %s raw=%u\n", SENSOR_LABELS[i], raw[i]);
+        activeSensorIndex = -1;
+        releaseCandidateSince = 0;
+        candidateSensorIndex = -1;
+        pressCandidateSince = 0;
       }
     } else {
-      if (sensorReleaseCondition(i, raw)) {
-        if (releaseCandidateAt[i] == 0) releaseCandidateAt[i] = now;
-        if (now - releaseCandidateAt[i] >= RELEASE_DEBOUNCE_MS) {
-          sensorLatched[i] = false;
-          releaseCandidateAt[i] = 0;
-          Serial.printf("[SENSOR] RELEASE %s raw=%u\n", SENSOR_LABELS[i], raw);
-        }
-      } else {
-        releaseCandidateAt[i] = 0;
+      releaseCandidateSince = 0;
+    }
+  } else {
+    // If more than one channel crosses its threshold, select the strongest
+    // change above baseline and only debounce that one candidate.
+    int8_t best = -1;
+    uint16_t bestDelta = 0;
+    for (uint8_t i = 0; i < 3; ++i) {
+      if (!sensorPressureCondition(i, raw[i])) continue;
+      const uint16_t delta = raw[i] > sensorBaseline[i]
+        ? (uint16_t)(raw[i] - sensorBaseline[i]) : raw[i];
+      if (best < 0 || delta > bestDelta) {
+        best = (int8_t)i;
+        bestDelta = delta;
       }
+    }
+
+    if (best < 0) {
+      candidateSensorIndex = -1;
+      pressCandidateSince = 0;
+    } else if (candidateSensorIndex != best) {
+      candidateSensorIndex = best;
+      pressCandidateSince = now;
+    } else if (now - pressCandidateSince >= PRESS_DEBOUNCE_MS) {
+      activeSensorIndex = best;
+      candidateSensorIndex = -1;
+      pressCandidateSince = 0;
+      releaseCandidateSince = 0;
+      enqueueSensorEvent((uint8_t)best, raw[best]);
+      handleFsrAudioFeedback((uint8_t)best);
     }
   }
 
